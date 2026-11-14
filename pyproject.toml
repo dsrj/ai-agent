@@ -1,0 +1,20 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cloudops_hub"]
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve the local Firewall engine's long prompts, KQL and diagnostic snippets.
+"cloudops_hub/firewall/**/*.py" = ["E501"]
+"tests/firewall/**/*.py" = ["E501"]
