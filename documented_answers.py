@@ -181,6 +181,7 @@ def collect_answers(
 def select_answer(
     client, settings, question, history, candidates, parameters, response_format,
     *, resource_groups=None, evidence_assessment=None, defer_finalization=False,
+    context_documents_out=None,
 ):
     if not candidates:
         return None
@@ -208,6 +209,10 @@ def select_answer(
             size += length
     if not bounded:
         return None
+    if context_documents_out is not None:
+        context_documents_out.extend({
+            **item["source"], "content": item["answer"], "section": item["section"],
+        } for item in bounded)
     result = complete(
         client,
         settings,

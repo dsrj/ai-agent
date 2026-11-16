@@ -6,6 +6,7 @@ import re
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from functools import partial
 from ipaddress import ip_address
 from typing import Any
@@ -1381,7 +1382,7 @@ def retrieve_documents(
                     ),
                 )
                 break
-            except FirewallAuditUnavailable:
+            except (FirewallAuditUnavailable, ModelRateLimited):
                 raise
             except RuntimeError:
                 logger.warning("Query understanding response rejected attempt=%d", attempt + 1)
@@ -1744,6 +1745,29 @@ class GroundedGeneration:
     status: str | None
     content: str | None
     sources: list[dict[str, Any]] | None
+
+
+@dataclass
+class RetrievedContext:
+    documents: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    broader: list[dict[str, Any]] | None = None
+    graph_index: Any = None
+    original_question: str = ""
+    graph_question: str = ""
+    graph_discovery: dict[str, Any] | None = None
+    semantic_discovery: dict[str, Any] | None = None
+    search_error: Exception | None = None
+    resource_groups: list[list[str]] = dataclass_field(default_factory=list)
+    query_used: dict[str, str] = dataclass_field(default_factory=dict)
+
+
+@dataclass
+class GraphEvidence:
+    result: dict[str, Any] | None = None
+    passages: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    reasoning: dict[str, Any] | None = None
+    context_parts: list[str] = dataclass_field(default_factory=list)
+    trace: list[dict[str, Any]] = dataclass_field(default_factory=list)
 
 
 def answer_messages(
@@ -2382,37 +2406,40 @@ def discover_graph_context(
     return original_query, query, original, semantic
 
 
+def document_trace(doc: dict[str, Any]) -> dict[str, Any]:
+    identity = doc.get("id", "")
+    if doc.get("source_id") == "local:validated-knowledge-graph":
+        identity = hashlib.sha256(identity.encode()).hexdigest()
+    return {
+        "id": identity,
+        "score": doc.get("@search.score"),
+        "reranker_score": doc.get("@search.reranker_score"),
+        "content_sha256": hashlib.sha256(doc.get("content", "").encode()).hexdigest(),
+    }
+
+
 def build_evidence(
     settings: Settings,
     assistant_id: str,
     known_errors: list[dict[str, Any]] | None,
     filtered: list[dict[str, Any]],
 ):
-    """Return the retrieval trace, numbered evidence passages and cited-source records."""
-    retrieval_trace = [
-        {
-            "id": (
-                hashlib.sha256(doc.get("id", "").encode()).hexdigest()
-                if doc.get("source_id") == "local:validated-knowledge-graph"
-                else doc.get("id", "")
-            ),
-            "score": doc.get("@search.score"),
-            "reranker_score": doc.get("@search.reranker_score"),
-        }
-        for doc in filtered
-    ]
+    """Return only admitted evidence in the trace, passages and source records."""
+    retrieval_trace = []
     context_parts = []
     sources = []
     context_size = 0
     for doc in filtered:
         index = len(sources) + 1
         source, passage = documentation_passage(doc, index, assistant_id)
-        if context_size + len(passage) > settings.retrieval_context_chars:
+        length = len(passage) + (2 if context_parts else 0)
+        if context_size + length > settings.retrieval_context_chars:
             if doc.get("source_kind") == "reviewed_contract":
                 raise ValueError("Complete resource contract exceeds the evidence budget")
             continue
         context_parts.append(passage)
-        context_size += len(passage)
+        context_size += length
+        retrieval_trace.append(document_trace(doc))
         sources.append(
             {
                 "id": index,
@@ -2441,13 +2468,17 @@ def build_evidence(
             f"Resolution: {entry.get('resolution', [])}\n"
             f"Escalation: {entry.get('escalation', 'Not configured')}"
         )
-        if context_size + len(passage) > settings.retrieval_context_chars:
+        length = len(passage) + (2 if context_parts else 0)
+        if context_size + length > settings.retrieval_context_chars:
             continue
         source_list = entry.get("sources", [])
         source = source_list[0] if source_list and isinstance(source_list[0], dict) else {}
         marker = len(sources) + 1
         context_parts.append(passage)
-        context_size += len(passage)
+        context_size += length
+        retrieval_trace.append(document_trace({
+            "id": "known-error:" + str(entry.get("id", "")), "content": passage,
+        }))
         sources.append(
             {
                 "id": marker,
@@ -2492,7 +2523,7 @@ def assess_evidence(
                 ),
                 "\n\n".join(parts),
             )
-        except FirewallAuditUnavailable:
+        except (FirewallAuditUnavailable, ModelRateLimited):
             raise
         except RuntimeError:
             logger.warning("Grounding response rejected attempt=%d", attempt + 1)
@@ -2553,6 +2584,269 @@ def expand_documents(
     return result
 
 
+def retrieve_context(
+    search: Any,
+    client: Any,
+    settings: Settings,
+    credential: Any,
+    assistant_id: str,
+    question: str,
+    search_question: str,
+    history: list[dict[str, str]],
+    *,
+    graph_index: Any,
+    semantic_plan: dict[str, Any] | None,
+    search_hint: str | None,
+    allow_contract: bool,
+    collect_resource_groups: bool,
+) -> RetrievedContext:
+    """Run document search and validated graph discovery concurrently, preserving failures."""
+    result = RetrievedContext(
+        graph_index=graph_index, original_question=question, graph_question=question,
+    )
+
+    def initial():
+        if search is None:
+            raise RuntimeError("Azure AI Search is unavailable")
+        return retrieve_documents(
+            search, client, settings, assistant_id, search_question,
+            history, credential,
+            **({"resource_groups_out": result.resource_groups} if collect_resource_groups else {}),
+            **({"search_hint": search_hint} if search_hint else {}),
+            **({"semantic_plan": semantic_plan} if semantic_plan else {}),
+            **({"defer_ambiguity": True} if graph_index is not None else {}),
+            query_used=result.query_used,
+            **({"allow_contract": False} if not allow_contract else {}),
+        )
+
+    def broader():
+        if search is None:
+            raise RuntimeError("Azure AI Search is unavailable")
+        return retrieve_documents(
+            search, client, settings, assistant_id, search_question, history, credential,
+            search_hint=search_hint, allow_contract=False, defer_ambiguity=True,
+            semantic_plan={
+                "query": question.strip()[:300],
+                "overview": semantic_plan["overview"] if semantic_plan else False,
+            },
+        )
+
+    if graph_index is None:
+        result.documents, result.search_error = guarded_search(initial, "Azure AI Search retrieval")
+    else:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="retrieval") as pool:
+            graph_future = pool.submit(
+                discover_graph_context, graph_index, question, history, semantic_plan,
+            )
+            broader_future = pool.submit(broader) if settings.retrieval_retry_enabled else None
+            result.documents, result.search_error = guarded_search(
+                initial, "Azure AI Search retrieval",
+            )
+            if broader_future or any(doc.get("answer_id") for doc in result.documents):
+                documents, failure = guarded_search(
+                    broader_future.result if broader_future else broader,
+                    "Broader Azure AI Search retrieval",
+                )
+                # None means failure, not an empty successful search: routes must fail closed.
+                if failure is None:
+                    result.broader = documents
+                    if broader_future:
+                        result.search_error = None
+            try:
+                (
+                    result.original_question, result.graph_question, result.graph_discovery,
+                    result.semantic_discovery,
+                ) = graph_future.result()
+            except PROTECTED_RETRIEVAL_ERRORS:
+                raise
+            except Exception as exc:
+                result.graph_index = None
+                logger.warning(
+                    "Knowledge graph retrieval failed error_type=%s", type(exc).__name__,
+                )
+        logger.info(
+            "Landing Zone parallel retrieval complete search_documents=%d "
+            "graph_assertions=%d search_available=%s graph_available=%s",
+            len(result.documents),
+            len(result.graph_discovery.get("items", [])) if result.graph_discovery else 0,
+            result.search_error is None, result.graph_index is not None,
+        )
+    if result.search_error is not None and result.graph_index is None:
+        raise RuntimeError("Documentation retrieval failed and no graph evidence is available")
+    return result
+
+
+def integrate_graph_evidence(
+    retrieved: RetrievedContext,
+    documents: list[dict[str, Any]],
+    client: Any,
+    settings: Settings,
+    assistant_id: str,
+    question: str,
+    history: list[dict[str, str]],
+    *,
+    semantic_plan: dict[str, Any] | None,
+    interpretation: dict[str, Any],
+    reconstructed: dict[tuple[Any, Any], dict[str, Any]],
+    known_errors: list[dict[str, Any]] | None,
+    contexts_out: list[dict[str, Any]] | None = None,
+) -> GraphEvidence:
+    """Integrate source-backed graph assertions and reason over the admitted evidence."""
+    if retrieved.graph_index is None:
+        raise ValueError("Graph evidence requires a validated graph index")
+    if retrieved.semantic_discovery is not None:
+        if semantic_plan is None:
+            raise ValueError("Semantic graph discovery requires its interpretation")
+        result = retrieved.graph_index.integrate_semantic_context(
+            retrieved.original_question, retrieved.graph_question, retrieved.graph_discovery,
+            retrieved.semantic_discovery, documents, semantic_plan["relationships"],
+        )
+    else:
+        result = retrieved.graph_index.integrate_question_context(
+            retrieved.graph_question, retrieved.graph_discovery, documents,
+        )
+    passages, incomplete = graph_documents(result, settings.retrieval_context_chars)
+    logger.info(
+        "Landing Zone evidence integration complete documentation=%d "
+        "graph_assertions=%d graph_incomplete=%s",
+        len(documents), len(result["items"]), incomplete,
+    )
+    trace, parts, sources = build_evidence(
+        settings, assistant_id, known_errors,
+        [*passages, *expand_documents(settings, question, reconstructed, documents)],
+    )
+    if not parts:
+        if any(doc.get("answer_id") for doc in documents):
+            raise answer_scope.AnswerContractUnavailable(
+                "Declared answer route exceeds the evidence context budget",
+            )
+        return GraphEvidence(result, passages, {
+            "summary": "", "missing": "No relevant documentation or graph evidence "
+            "was retrieved.", "source_ids": [], "clarification": "",
+        })
+    if contexts_out is not None:
+        contexts_out.append({"stage": "evidence_reasoning", "documents": trace})
+    for attempt in range(2):
+        try:
+            reasoning = reason_across_evidence(
+                client, settings, question, history, parts, len(sources),
+                {**interpretation, "graph_discoveries": result.get("discoveries", [])},
+            )
+            return GraphEvidence(result, passages, reasoning, parts, trace)
+        except (FirewallAuditUnavailable, ModelRateLimited):
+            raise
+        except RuntimeError:
+            logger.warning("Evidence reasoning rejected attempt=%d", attempt + 1)
+            if attempt:
+                raise
+
+
+def documented_response(
+    client: Any,
+    settings: Settings,
+    assistant_id: str,
+    question: str,
+    history: list[dict[str, str]],
+    documents: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    *,
+    resource_groups: list[list[str]],
+    graph_index: Any,
+    graph_evidence: GraphEvidence,
+    diagram_selection_question: str,
+    retrieval_trace: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Select and finalize one complete reviewed answer, preserving route contracts."""
+    route_ids = {
+        doc["answer_id"] for doc in documents
+        if assistant_id != "firewall" and doc.get("answer_id")
+    }
+    if route_ids:
+        if len(route_ids) != 1 or len(candidates) != 1:
+            raise answer_scope.AnswerContractUnavailable(
+                "Declared answer route did not reconstruct exactly one answer",
+            )
+        source = candidates[0]["source"]
+        if (
+            source.get("answer_id") not in route_ids
+            or source.get("answer_presentation_version") != 1
+            or source.get("answer_disposition") != "direct"
+            or not isinstance(source.get("answer_section_body"), str)
+        ):
+            raise answer_scope.AnswerContractUnavailable(
+                "Declared answer route has incomplete presentation or body",
+            )
+    selected = None
+    for attempt in range(2):
+        selection_documents = []
+        try:
+            selected = select_answer(
+                client, settings, question, history, candidates,
+                completion_parameters, structured_response,
+                resource_groups=resource_groups,
+                **({"evidence_assessment": {
+                    "assessment": graph_evidence.reasoning,
+                    "passages": graph_evidence.context_parts,
+                }} if graph_evidence.reasoning is not None else {}),
+                **({"defer_finalization": True} if graph_index is not None else {}),
+                context_documents_out=selection_documents,
+            )
+            break
+        except (ValueError, TypeError):
+            logger.warning("Documented answer response rejected attempt=%d", attempt + 1)
+            if attempt:
+                logger.warning(
+                    "FAQ selection invalid; using reconstructed evidence for grounded answer",
+                )
+                return None
+        finally:
+            if selection_documents:
+                retrieval_trace["contexts"].append({
+                    "stage": "answer_selection",
+                    "documents": [
+                        *graph_evidence.trace, *map(document_trace, selection_documents),
+                    ],
+                })
+    if selected is None:
+        return None
+    diagram = None
+    if graph_index is not None:
+        source, section = selected["source"], selected["section"]
+        matching_documents = [
+            doc for doc in documents
+            if doc.get("source_id") == source.get("source_id")
+            and doc.get("source_path") == source.get("source_path")
+            and isinstance(doc.get("section"), str)
+            and (doc["section"] == section or doc["section"].startswith(section + " > "))
+        ]
+        diagram = graph_diagram_for_question(
+            graph_index, graph_evidence.result, diagram_selection_question, matching_documents,
+            explicit=False,
+        )
+        selected = finalize_answer(
+            client, settings, selected, selected["_translate"], selected["_language"],
+            completion_parameters, structured_response,
+        )
+    selected_trace, _, sources = build_evidence(settings, assistant_id, None, [{
+        **selected["source"], "section": selected["section"], "content": selected["answer"],
+    }])
+    if not sources:
+        raise ValueError("Documented answer exceeded the evidence context budget")
+    retrieval_trace["contexts"].append({"stage": "selected_answer", "documents": selected_trace})
+    return {
+        "status": "answered",
+        "answer": selected["answer"],
+        "sources": sources,
+        "retrieval_trace": retrieval_trace,
+        "confidence": evidence_confidence(sources, direct_reviewed_answer=True),
+        **({"answer_contract": {
+            "version": 1, "id": selected["source"]["answer_id"],
+            "layout": selected["source"]["answer_layout"],
+        }} if route_ids else {}),
+        **({"diagram": diagram} if diagram else {}),
+    }
+
+
 def answer_question(
     settings: Settings,
     assistant_id: str,
@@ -2603,7 +2897,7 @@ def answer_question(
     credential = DefaultAzureCredential()
     stage = "initialization"
     search_error = None
-    graph_error = None
+    retrieval_trace: dict[str, Any] = {"retrieved": [], "contexts": []}
     try:
         search = None
         if search_configured:
@@ -2630,27 +2924,19 @@ def answer_question(
         reconstructed = {}
         prefetched_answers = {}
         evidence_reasoning = None
-        reasoning_evidence = []
+        graph_evidence = GraphEvidence()
         graph_passages: list[dict] = []
-        graph_incomplete = False
         graph_result: dict[str, Any] | None = None
         graph_index = None
         semantic_plan = None
         interpretation = {}
         ambiguous_lookup = False
-        graph_discovery = None
-        semantic_discovery = None
-        graph_original_question = question
-        graph_question = question
-        broader = None
-        search_query_used: dict[str, str] = {}
 
         build = partial(build_evidence, settings, assistant_id, known_errors)
         assess = partial(
             assess_evidence, client, settings, assistant_id, question, history, parameter_context,
         )
         expanded = partial(expand_documents, settings, question, reconstructed)
-
 
         def answer_key(documents):
             return tuple((doc.get("id"), doc.get("answer_id")) for doc in documents)
@@ -2675,6 +2961,7 @@ def answer_question(
             reconstructed.update({
                 (doc["source_id"], doc["source_path"]): doc for doc in evidence_documents
             })
+            retrieval_trace["retrieved"].extend(map(document_trace, evidence_documents))
             return candidates
 
         def documented(filtered):
@@ -2695,107 +2982,17 @@ def answer_question(
                 prefetched_answers[answer_key(filtered)]
                 if graph_index is not None else collect_documented(filtered)
             )
-            route_ids = {
-                doc["answer_id"] for doc in filtered
-                if assistant_id != "firewall" and doc.get("answer_id")
-            }
-            selected = None
-            if route_ids:
-                if len(route_ids) != 1 or len(candidates) != 1:
-                    raise answer_scope.AnswerContractUnavailable(
-                        "Declared answer route did not reconstruct exactly one answer",
+            return documented_response(
+                client, settings, assistant_id, question, history, filtered, candidates,
+                resource_groups=[] if any(doc.get("answer_id") for doc in filtered) else (
+                    retrieved_resource_groups or resource_scope_groups(
+                        question, load_synonyms(settings, credential, assistant_id=assistant_id),
                     )
-                source = candidates[0]["source"]
-                if (
-                    source.get("answer_id") not in route_ids
-                    or source.get("answer_presentation_version") != 1
-                    or source.get("answer_disposition") != "direct"
-                    or not isinstance(source.get("answer_section_body"), str)
-                ):
-                    raise answer_scope.AnswerContractUnavailable(
-                        "Declared answer route has incomplete presentation or body",
-                    )
-            for attempt in range(2):
-                try:
-                    selected = select_answer(
-                        client,
-                        settings,
-                        question,
-                        history,
-                        candidates,
-                        completion_parameters,
-                        structured_response,
-                        resource_groups=[] if any(doc.get("answer_id") for doc in filtered) else (
-                            retrieved_resource_groups or resource_scope_groups(
-                                question,
-                                load_synonyms(settings, credential, assistant_id=assistant_id),
-                            )
-                        ) if assistant_id == "landing-zone" else [],
-                        **({"evidence_assessment": {
-                            "assessment": evidence_reasoning, "passages": reasoning_evidence,
-                        }} if evidence_reasoning is not None else {}),
-                        **({"defer_finalization": True} if graph_index is not None else {}),
-                    )
-                    break
-                except (ValueError, TypeError):
-                    logger.warning("Documented answer response rejected attempt=%d", attempt + 1)
-                    if attempt:
-                        logger.warning(
-                            "FAQ selection invalid; using reconstructed evidence "
-                            "for grounded answer"
-                        )
-                        return None
-            if selected is None:
-                return None
-            diagram = None
-            if graph_index is not None:
-                source = selected["source"]
-                section = selected["section"]
-                matching_documents = [
-                    doc for doc in filtered
-                    if doc.get("source_id") == source.get("source_id")
-                    and doc.get("source_path") == source.get("source_path")
-                    and isinstance(doc.get("section"), str)
-                    and (
-                        doc["section"] == section
-                        or doc["section"].startswith(section + " > ")
-                    )
-                ]
-                diagram = graph_diagram_for_question(
-                    graph_index, graph_result, diagram_selection_question, matching_documents,
-                    explicit=False,
-                )
-                selected = finalize_answer(
-                    client, settings, selected, selected["_translate"], selected["_language"],
-                    completion_parameters, structured_response,
-                )
-            _, _, selected_sources = build(
-                [
-                    {
-                        **selected["source"],
-                        "section": selected["section"],
-                        "content": selected["answer"],
-                    }
-                ]
+                ) if assistant_id == "landing-zone" else [],
+                graph_index=graph_index, graph_evidence=graph_evidence,
+                diagram_selection_question=diagram_selection_question,
+                retrieval_trace=retrieval_trace,
             )
-            if not selected_sources:
-                raise ValueError("Documented answer exceeded the evidence context budget")
-            result = {
-                "status": "answered",
-                "answer": selected["answer"],
-                "sources": selected_sources,
-                "retrieval_trace": retrieval_trace,
-                "confidence": evidence_confidence(selected_sources, direct_reviewed_answer=True),
-                **({
-                    "answer_contract": {
-                        "version": 1, "id": selected["source"]["answer_id"],
-                        "layout": selected["source"]["answer_layout"],
-                    },
-                } if route_ids else {}),
-            }
-            if diagram:
-                result["diagram"] = diagram
-            return result
 
         if assistant_id == "landing-zone" and graph_directory:
             from cloudops_hub.graph_navigation import load_graph
@@ -2814,110 +3011,29 @@ def answer_question(
             try:
                 graph_index = load_graph(graph_directory)
             except Exception as exc:
-                graph_error = exc
                 graph_index = None
                 logger.warning(
                     "Knowledge graph initialization failed error_type=%s",
                     type(exc).__name__,
                 )
 
-        def retrieve_initial():
-            if search is None:
-                raise RuntimeError("Azure AI Search is unavailable")
-            return retrieve_documents(
-                search, client, settings, assistant_id, search_question, history, credential,
-                **(
-                    {"resource_groups_out": retrieved_resource_groups}
-                    if assistant_id == "landing-zone" and not diagram_request else {}
-                ),
-                **({"search_hint": search_hint} if search_hint else {}),
-                **({"semantic_plan": semantic_plan} if semantic_plan else {}),
-                **({"defer_ambiguity": True} if graph_index is not None else {}),
-                **{"query_used": search_query_used},
-                **(
-                    {"allow_contract": False}
-                    if assistant_id != "firewall"
-                    and (parameter_context or known_errors or ambiguous_lookup) else {}
-                ),
-            )
-
+        stage = "retrieval"
+        retrieved = retrieve_context(
+            search, client, settings, credential, assistant_id, question, search_question, history,
+            graph_index=graph_index, semantic_plan=semantic_plan, search_hint=search_hint,
+            allow_contract=not (
+                assistant_id != "firewall"
+                and (parameter_context or known_errors or ambiguous_lookup)
+            ),
+            collect_resource_groups=assistant_id == "landing-zone" and not diagram_request,
+        )
+        filtered, broader, graph_index = (
+            retrieved.documents, retrieved.broader, retrieved.graph_index,
+        )
+        search_error = retrieved.search_error
+        retrieved_resource_groups = retrieved.resource_groups
+        retrieval_trace["retrieved"].extend(map(document_trace, [*filtered, *(broader or [])]))
         if graph_index is not None:
-            discover_graph = partial(
-                discover_graph_context, graph_index, question, history, semantic_plan,
-            )
-
-            def retrieve_broader():
-                if search is None:
-                    raise RuntimeError("Azure AI Search is unavailable")
-                return retrieve_documents(
-                    search, client, settings, assistant_id, search_question, history, credential,
-                    search_hint=search_hint, allow_contract=False,
-                    defer_ambiguity=True,
-                    semantic_plan={
-                        "query": question.strip()[:300],
-                        "overview": semantic_plan["overview"] if semantic_plan else False,
-                    },
-                )
-
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="retrieval") as pool:
-                graph_future = pool.submit(discover_graph)
-                broader_future = (
-                    pool.submit(retrieve_broader) if settings.retrieval_retry_enabled else None
-                )
-                stage = "retrieval"
-                filtered, failure = guarded_search(retrieve_initial, "Azure AI Search retrieval")
-                if failure is not None:
-                    search_error = failure
-                # A failed broader search stays None so that a declared route fails closed
-                # instead of silently degrading to the initial documents.
-                if broader_future:
-                    documents, failure = guarded_search(
-                        broader_future.result, "Broader Azure AI Search retrieval",
-                    )
-                    if failure is None:
-                        broader = documents
-                        search_error = None
-                elif any(doc.get("answer_id") for doc in filtered):
-                    documents, failure = guarded_search(
-                        retrieve_broader, "Broader Azure AI Search retrieval",
-                    )
-                    if failure is None:
-                        broader = documents
-                stage = "graph_retrieval"
-                try:
-                    (
-                        graph_original_question, graph_question, graph_discovery,
-                        semantic_discovery,
-                    ) = graph_future.result()
-                except Exception as exc:
-                    graph_error = exc
-                    graph_index = None
-                    logger.warning(
-                        "Knowledge graph retrieval failed error_type=%s",
-                        type(exc).__name__,
-                    )
-            if graph_index is not None:
-                from cloudops_hub.graph_navigation import validate_retrieved_graph
-
-                try:
-                    validate_retrieved_graph(graph_directory, graph_index)
-                except Exception as exc:
-                    graph_error = exc
-                    graph_index = None
-                    graph_discovery = None
-                    semantic_discovery = None
-                    logger.warning(
-                        "Knowledge graph validation failed error_type=%s",
-                        type(exc).__name__,
-                    )
-            logger.info(
-                "Landing Zone parallel retrieval complete search_documents=%d "
-                "graph_assertions=%d search_available=%s graph_available=%s",
-                len(filtered),
-                len(graph_discovery.get("items", [])) if graph_discovery else 0,
-                search_error is None,
-                graph_error is None,
-            )
             if not (diagram_request or parameter_context or known_errors):
                 prepared = (
                     [contract_document(catalog_input), *filtered] if catalog_input else filtered
@@ -2940,14 +3056,6 @@ def answer_question(
                         prefetched_answers[answer_key(fallback_documents)] = collect_documented(
                             fallback_documents
                         )
-        else:
-            filtered, failure = guarded_search(retrieve_initial, "Azure AI Search retrieval")
-            if failure is not None:
-                search_error = failure
-        if search_error is not None and graph_error is not None:
-            raise RuntimeError("Both documentation and knowledge-graph retrieval failed")
-        if search_error is not None and graph_index is None:
-            raise RuntimeError("Documentation retrieval failed and no graph evidence is available")
         if catalog_input:
             filtered = [contract_document(catalog_input), *filtered]
         if broader is not None:
@@ -2960,56 +3068,17 @@ def answer_question(
         if broader is not None and not any(doc.get("answer_id") for doc in filtered):
             filtered = integration_documents
 
-        def integrate_graph(documents):
-            if semantic_discovery is not None:
-                return graph_index.integrate_semantic_context(
-                    graph_original_question, graph_question, graph_discovery,
-                    semantic_discovery, documents, semantic_plan["relationships"],
-                )
-            return graph_index.integrate_question_context(
-                graph_question, graph_discovery, documents,
-            )
-
-        def reason(documents):
-            nonlocal reasoning_evidence
-            _, parts, source_list = build([*graph_passages, *expanded(documents)])
-            reasoning_evidence = parts
-            if not parts and any(doc.get("answer_id") for doc in documents):
-                raise answer_scope.AnswerContractUnavailable(
-                    "Declared answer route exceeds the evidence context budget",
-                )
-            if not parts:
-                return {
-                    "summary": "", "missing": "No relevant documentation or graph evidence "
-                    "was retrieved.", "source_ids": [], "clarification": "",
-                }
-            for attempt in range(2):
-                try:
-                    return reason_across_evidence(
-                        client, settings, question, history, parts, len(source_list),
-                        {
-                            **interpretation,
-                            "graph_discoveries": graph_result.get("discoveries", []),
-                        },
-                    )
-                except RuntimeError:
-                    logger.warning("Evidence reasoning rejected attempt=%d", attempt + 1)
-                    if attempt:
-                        raise
-
         if graph_index is not None:
-            graph_result = integrate_graph(integration_documents)
-            graph_passages, graph_incomplete = graph_documents(
-                graph_result, settings.retrieval_context_chars
-            )
-            logger.info(
-                "Landing Zone evidence integration complete documentation=%d "
-                "graph_assertions=%d graph_incomplete=%s",
-                len(integration_documents), len(graph_result["items"]), graph_incomplete,
-            )
             stage = "evidence_reasoning"
-            evidence_reasoning = reason(integration_documents)
-        retrieval_trace, context_parts, sources = build(filtered)
+            graph_evidence = integrate_graph_evidence(
+                retrieved, integration_documents, client, settings, assistant_id, question, history,
+                semantic_plan=semantic_plan, interpretation=interpretation,
+                reconstructed=reconstructed, known_errors=known_errors,
+                contexts_out=retrieval_trace["contexts"],
+            )
+            graph_result, graph_passages = graph_evidence.result, graph_evidence.passages
+            evidence_reasoning = graph_evidence.reasoning
+        _, context_parts, sources = build(filtered)
         stage = "documented_answer"
         selected_result = documented(filtered)
         if selected_result:
@@ -3020,26 +3089,35 @@ def answer_question(
             if broader is None:
                 if graph_index is not None:
                     raise RuntimeError("Broader retrieval was not completed before validation")
-                broader = retrieve_documents(
-                    search, client, settings, assistant_id, search_question, history, credential,
-                    search_hint=search_hint, resource_groups_out=retrieved_resource_groups,
-                    allow_contract=False,
-                    **({"semantic_plan": semantic_plan} if semantic_plan else {}),
+                broader, failure = guarded_search(
+                    lambda: retrieve_documents(
+                        search, client, settings, assistant_id, search_question,
+                        history, credential,
+                        search_hint=search_hint, resource_groups_out=retrieved_resource_groups,
+                        allow_contract=False,
+                        **({"semantic_plan": semantic_plan} if semantic_plan else {}),
+                    ),
+                    "Broader Azure AI Search retrieval",
                 )
+                if failure is not None:
+                    raise RuntimeError("Broader retrieval failed for a declared answer route")
+                retrieval_trace["retrieved"].extend(map(document_trace, broader))
             seen = {doc.get("id") for doc in broader}
             filtered = broader + [
                 {key: value for key, value in doc.items() if key != "answer_id"}
                 for doc in filtered if doc.get("id") not in seen
             ]
-            retrieval_trace, context_parts, sources = build(filtered)
+            _, context_parts, sources = build(filtered)
             stage = "documented_answer"
             selected_result = documented(filtered)
             if selected_result:
                 return selected_result
-        retrieval_trace, context_parts, sources = build(
+        context_trace, context_parts, sources = build(
             [*graph_passages, *expanded(filtered)]
         )
         stage = "grounding"
+        if context_parts:
+            retrieval_trace["contexts"].append({"stage": stage, "documents": context_trace})
         decision = assess(context_parts)
         if decision == "undocumented" and settings.retrieval_retry_enabled and graph_index is None:
             # One reformulated search when the evidence was insufficient; best effort only.
@@ -3052,7 +3130,7 @@ def answer_question(
                     search_question,
                     history,
                     credential,
-                    search_query_used.get("query")
+                    retrieved.query_used.get("query")
                     or (semantic_plan or {}).get("query")
                     or search_hint
                     or question,
@@ -3067,30 +3145,25 @@ def answer_question(
                 ),
                 "Retry search",
             )
+            retrieval_trace["retrieved"].extend(map(document_trace, retried))
             seen = {doc.get("id") for doc in retried}
             if any(doc.get("id") not in {d.get("id") for d in filtered} for doc in retried):
                 merged = retried + [doc for doc in filtered if doc.get("id") not in seen]
                 if catalog_input:
                     contract = contract_document(catalog_input)
                     merged = [contract, *(doc for doc in merged if doc.get("id") != contract["id"])]
-                if assistant_id == "landing-zone" and graph_index is not None:
-                    graph_result = integrate_graph(merged)
-                    graph_passages, graph_incomplete = graph_documents(
-                        graph_result, settings.retrieval_context_chars
-                    )
-                    filtered = merged
-                    stage = "evidence_reasoning"
-                    evidence_reasoning = reason(merged)
                 filtered = merged
-                retrieval_trace, context_parts, sources = build(merged)
+                _, context_parts, sources = build(merged)
                 stage = "documented_answer"
                 selected_result = documented(merged)
                 if selected_result:
                     return selected_result
-                retrieval_trace, context_parts, sources = build(
+                context_trace, context_parts, sources = build(
                     [*graph_passages, *expanded(merged)]
                 )
                 stage = "grounding"
+                if context_parts:
+                    retrieval_trace["contexts"].append({"stage": stage, "documents": context_trace})
                 decision = assess(context_parts)
         pending_clarification = bool(
             evidence_reasoning and evidence_reasoning["clarification"]
@@ -3119,6 +3192,7 @@ def answer_question(
                 "status": "unknown",
                 "answer": "No documented answer found. Contact the CloudOps team.",
                 "sources": [],
+                "retrieval_trace": retrieval_trace,
                 **(
                     {"knowledge_gap": knowledge_gap("")}
                     if diagram_request and not graph_directory else {}
@@ -3147,6 +3221,9 @@ def answer_question(
             interpretation=interpretation,
             expected_status=expected_status,
         )
+        retrieval_trace["contexts"].append({
+            "stage": "answer_generation", "documents": context_trace,
+        })
         generated = generate_grounded_answer(
             client, settings, assistant_id, messages, sources, context_parts, question,
             known_errors=known_errors,
@@ -3186,8 +3263,11 @@ def answer_question(
                     from cloudops_hub.graph_diagram import UNSUPPORTED_PROJECTION_INTENT
 
                     if not UNSUPPORTED_PROJECTION_INTENT.search(question):
-                        _, diagram_parts, diagram_sources = build(filtered)
+                        diagram_trace, diagram_parts, diagram_sources = build(filtered)
                         if diagram_sources:
+                            retrieval_trace["contexts"].append({
+                                "stage": "diagram_generation", "documents": diagram_trace,
+                            })
                             extra = build_diagram(
                                 client,
                                 settings,
@@ -3230,6 +3310,7 @@ def answer_question(
             ),
             "error_code": "answer_contract_not_ready",
             "sources": [],
+            "retrieval_trace": retrieval_trace,
         }
     except answer_scope.AmbiguousAnswerRoute as exc:
         return {
@@ -3240,6 +3321,7 @@ def answer_question(
                 or "Which single resource and task should I answer first?"
             ),
             "sources": [],
+            "retrieval_trace": retrieval_trace,
         }
     except FirewallAuditUnavailable:
         raise
@@ -3263,6 +3345,7 @@ def answer_question(
             ),
             "error_code": "response_invalid" if invalid_response else "request_failed",
             "sources": [],
+            "retrieval_trace": retrieval_trace,
         }
     finally:
         credential.close()

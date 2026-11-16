@@ -423,36 +423,35 @@ def load_graph(directory: str) -> GraphIndex:
 
 
 @lru_cache(maxsize=1)
-def _load_snapshot(directory: str) -> Any:
+def _load_validated_package(directory: str) -> tuple[Any, dict[str, Any]]:
     from cloudops_knowledge_mcp.snapshot import parse_snapshot
+
+    from cloudops_hub.graph_schema import load_validated_schema
 
     root = Path(directory)
     pin = json.loads((root / "snapshot-pin.json").read_bytes())
     snapshot = parse_snapshot((root / "snapshot.json").read_bytes(), pin["snapshot_sha256"])
     if snapshot.commit != pin["commit"] or snapshot.manifest_sha256 != pin["manifest_sha256"]:
         raise ValueError("Knowledge graph does not match the approved pin")
-    return snapshot
+    return snapshot, load_validated_schema(root, snapshot)
 
 
 @lru_cache(maxsize=1)
 def load_semantic_graph(directory: str) -> GraphIndex:
-    """Prepare source-declared terminology without applying the ontology."""
+    """Validate the package before exposing source-declared terminology."""
     with _load_lock:
-        return GraphIndex(_load_snapshot(directory))
+        snapshot, _ = _load_validated_package(directory)
+        return GraphIndex(snapshot)
 
 
 @lru_cache(maxsize=1)
 def _load_graph(directory: str) -> GraphIndex:
-    root = Path(directory)
-    snapshot = _load_snapshot(directory)
-    from cloudops_hub.graph_schema import load_validated_schema
-
-    ontology = load_validated_schema(root, snapshot, validate_graph=False)
+    snapshot, ontology = _load_validated_package(directory)
     return GraphIndex(snapshot, ontology)
 
 
 def validate_retrieved_graph(directory: str, index: GraphIndex) -> None:
-    """Validate the pinned graph after discovery and before using it as evidence."""
+    """Validate an explicitly supplied index; normal loaders already validate before use."""
     with _validation_lock:
         _validate_retrieved_graph(directory, index)
 

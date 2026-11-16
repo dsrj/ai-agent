@@ -12,6 +12,26 @@ def record_retrieval(settings, message_id: str, question: str, result: dict) -> 
     fingerprint = hmac.new(
         settings.session_secret.encode(), question.encode(), hashlib.sha256
     ).hexdigest()
+    trace = result.get("retrieval_trace")
+    if isinstance(trace, dict):
+        documents = [
+            {**document, "stage": context["stage"]}
+            for context in trace["contexts"] for document in context["documents"]
+        ]
+        retrieved = {"retrieved_documents": trace["retrieved"]}
+    else:
+        documents = trace if trace is not None else [
+            {
+                "id": source.get("document_id")
+                or hashlib.sha256(
+                    (source.get("url", "") + source.get("path", "")).encode()
+                ).hexdigest(),
+                "score": source.get("score"),
+                "reranker_score": source.get("reranker_score"),
+            }
+            for source in result.get("sources", [])
+        ]
+        retrieved = {}
     logger.info(
         "retrieval_event %s",
         json.dumps(
@@ -24,18 +44,8 @@ def record_retrieval(settings, message_id: str, question: str, result: dict) -> 
                 "hybrid": settings.azure_search_hybrid_enabled,
                 "semantic": settings.azure_search_semantic_enabled,
                 "index": settings.azure_search_index,
-                "documents": result.get("retrieval_trace")
-                or [
-                    {
-                        "id": source.get("document_id")
-                        or hashlib.sha256(
-                            (source.get("url", "") + source.get("path", "")).encode()
-                        ).hexdigest(),
-                        "score": source.get("score"),
-                        "reranker_score": source.get("reranker_score"),
-                    }
-                    for source in result.get("sources", [])
-                ],
+                "documents": documents,
+                **retrieved,
             }
         ),
     )
